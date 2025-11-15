@@ -1,14 +1,16 @@
 services:
   litellm:
-    # build:
-    #   context: .
+    build:
+      dockerfile: Dockerfile.litellm
+      context: .
     #   args:
     #     target: runtime
-    image: ghcr.io/berriai/litellm:main-stable
+    # image: ghcr.io/berriai/litellm:main-stable
+    image: litellm-with-config
     #########################################
     ## Uncomment these lines to start proxy with a config.yaml file ##
-    volumes:
-      - ./config.yaml:/app/config.yaml
+    # volumes:
+      # - ./config.yaml:/app/config.yaml
     command:
       - "--config=/app/config.yaml"
     ##############################################
@@ -49,10 +51,14 @@ services:
       retries: 10
 
   prometheus:
-    image: prom/prometheus
+    build:
+      dockerfile: Dockerfile.prometheus
+      context: .
+    # image: prom/prometheus
+    image: prometheus-with-config
     volumes:
       - prometheus_data:/prometheus
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      # - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
     command:
