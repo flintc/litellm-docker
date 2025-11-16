@@ -1,4 +1,42 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+
+// Helper function to convert JSON schema properties to Zod schema
+function jsonSchemaToZod(properties: Record<string, any>, required: string[] = []): Record<string, z.ZodTypeAny> {
+  const zodSchema: Record<string, z.ZodTypeAny> = {};
+  
+  for (const [key, prop] of Object.entries(properties)) {
+    let zodType: z.ZodTypeAny;
+    
+    if (prop.type === 'string') {
+      zodType = z.string();
+    } else if (prop.type === 'number' || prop.type === 'integer') {
+      zodType = z.number();
+    } else if (prop.type === 'boolean') {
+      zodType = z.boolean();
+    } else if (prop.type === 'array') {
+      zodType = z.array(z.any());
+    } else if (prop.type === 'object') {
+      zodType = z.record(z.any());
+    } else {
+      zodType = z.any();
+    }
+    
+    // Add description if available
+    if (prop.description) {
+      zodType = zodType.describe(prop.description);
+    }
+    
+    // Make optional if not in required array
+    if (!required.includes(key)) {
+      zodType = zodType.optional();
+    }
+    
+    zodSchema[key] = zodType;
+  }
+  
+  return zodSchema;
+}
 
 // Logging utility functions
 const log = {
@@ -401,10 +439,23 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       max_tokens?: number;
       temperature?: number;
       stream?: boolean;
+      response_format?: {
+        type?: string;
+        json_schema?: {
+          name?: string;
+          schema?: {
+            type?: string;
+            properties?: Record<string, any>;
+            required?: string[];
+            additionalProperties?: boolean;
+          };
+          strict?: boolean;
+        };
+      };
     };
     const parseTime = Date.now() - parseStartTime;
     
-    const { model, messages, max_tokens, temperature, stream } = body;
+    const { model, messages, max_tokens, temperature, stream, response_format } = body;
     
     log.info(`[${requestId}] Request parsed`, {
       parseTimeMs: parseTime,
@@ -413,6 +464,7 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       maxTokens: max_tokens,
       temperature: temperature,
       stream: stream,
+      hasResponseFormat: !!response_format,
     });
     
     log.debug(`[${requestId}] Request body`, {
@@ -469,17 +521,82 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       promptPreview: prompt.substring(0, 200) + (prompt.length > 200 ? '...' : ''),
     });
 
+    // Check if structured output is requested via response_format
+    const needsStructuredOutput = response_format?.json_schema?.schema?.properties?.score && 
+                                  response_format?.json_schema?.schema?.properties?.reasoning;
+    
     // Prepare options for the SDK
-    const options = {
+    const options: any = {
       maxTurns: 1,
       model: model || 'claude-sonnet-4-5',
-      // Add other options if needed
     };
+    
+    // Add MCP server with tool if structured output is requested
+    if (needsStructuredOutput) {
+      const schema = response_format.json_schema!.schema!;
+      const toolName = response_format.json_schema!.name || 'extract';
+      const mcpServerName = 'structured-output';
+      
+      // Convert JSON schema to Zod schema
+      const zodSchemaFields = jsonSchemaToZod(
+        schema.properties || {},
+        schema.required || []
+      );
+      
+      // Create Zod object schema
+      const zodSchema = z.object(zodSchemaFields);
+      
+      // Create tool with Zod schema
+      const extractTool = tool(
+        toolName,
+        'Extract structured information based on the provided schema. Return the structured data matching the schema.',
+        zodSchemaFields,
+        async (input) => {
+          // Validate input against Zod schema
+          const validated = zodSchema.parse(input);
+          
+          // Return the validated input as tool output
+          // The LLM will receive this and pass it to the user
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(validated),
+              },
+            ],
+          };
+        }
+      );
+      
+      // Create MCP server with the tool
+      const mcpServer = createSdkMcpServer({
+        name: mcpServerName,
+        version: '1.0.0',
+        tools: [extractTool],
+      });
+      
+      // Add MCP server to options
+      options.mcpServers = {
+        [mcpServerName]: mcpServer,
+      };
+      
+      // Specify allowed tools (format: mcp__<server-name>__<tool-name>)
+      options.allowedTools = [`mcp__${mcpServerName}__${toolName}`];
+      
+      log.info(`[${requestId}] Structured output requested via MCP`, {
+        toolName,
+        mcpServerName,
+        schemaProperties: Object.keys(schema.properties || {}),
+        required: schema.required || [],
+        allowedTool: `mcp__${mcpServerName}__${toolName}`,
+      });
+    }
     
     log.info(`[${requestId}] Calling SDK query`, {
       options: {
         maxTurns: options.maxTurns,
         model: options.model,
+        hasTools: !!options.tools,
       },
       promptLength: prompt.length,
     });
@@ -500,44 +617,118 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
         async start(controller) {
           try {
             let assistantContent = '';
-            let hasStarted = false;
+            let toolOutput: any = null;
             
             for await (const message of queryResult) {
-              if (message.type === 'assistant') {
-                const apiMessage = message.message;
-                if (apiMessage.content && Array.isArray(apiMessage.content)) {
-                  const textBlocks = apiMessage.content.filter(
-                    (block: any) => block.type === 'text'
-                  );
-                  if (textBlocks.length > 0) {
-                    const newText = textBlocks.map((block: any) => block.text).join('\n');
-                    
-                    // Stream incremental content
-                    const delta = newText.slice(assistantContent.length);
-                    if (delta) {
-                      const chunk = {
-                        id: responseId,
-                        object: 'chat.completion.chunk',
-                        created: created,
-                        model: modelName,
-                        choices: [
-                          {
-                            index: 0,
-                            delta: {
-                              role: 'assistant',
-                              content: delta,
-                            },
-                            finish_reason: null,
-                          },
-                        ],
-                      };
-                      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              // Check for tool result messages (MCP tools return results)
+              if (message.type === 'result' && needsStructuredOutput && !toolOutput) {
+                const resultMessage = message as any;
+                if (resultMessage.subtype === 'success' && resultMessage.result) {
+                  // Extract tool result content
+                  if (resultMessage.result.content && Array.isArray(resultMessage.result.content)) {
+                    const textBlocks = resultMessage.result.content.filter(
+                      (block: any) => block.type === 'text'
+                    );
+                    if (textBlocks.length > 0) {
+                      const resultText = textBlocks.map((block: any) => block.text).join('\n');
+                      try {
+                        // Parse the JSON string returned by the tool
+                        toolOutput = JSON.parse(resultText);
+                        log.info(`[${requestId}] Tool result extracted in stream from result message`, {
+                          toolOutput,
+                        });
+                      } catch (e) {
+                        log.warn(`[${requestId}] Failed to parse tool result as JSON in stream`, { resultText });
+                      }
                     }
-                    
-                    assistantContent = newText;
                   }
                 }
               }
+              
+              if (message.type === 'assistant') {
+                const apiMessage = message.message;
+                if (apiMessage.content && Array.isArray(apiMessage.content)) {
+                  // Check for tool use blocks if structured output is requested
+                  // This extracts the tool input (structured data) that the LLM is trying to return
+                  if (needsStructuredOutput && !toolOutput) {
+                    const toolUseBlocks = apiMessage.content.filter(
+                      (block: any) => block.type === 'tool_use'
+                    );
+                    
+                    if (toolUseBlocks.length > 0) {
+                      const toolUse = toolUseBlocks[0];
+                      if (toolUse.input) {
+                        toolOutput = toolUse.input;
+                        log.info(`[${requestId}] Tool input extracted in stream from tool_use block`, {
+                          toolName: toolUse.name,
+                          toolOutput,
+                        });
+                      }
+                    }
+                  } else if (!needsStructuredOutput) {
+                    // Extract text content (for non-structured output only)
+                    const textBlocks = apiMessage.content.filter(
+                      (block: any) => block.type === 'text'
+                    );
+                    if (textBlocks.length > 0) {
+                      const newText = textBlocks.map((block: any) => block.text).join('\n');
+                      
+                      // Stream incremental content
+                      const delta = newText.slice(assistantContent.length);
+                      if (delta) {
+                        const chunk = {
+                          id: responseId,
+                          object: 'chat.completion.chunk',
+                          created: created,
+                          model: modelName,
+                          choices: [
+                            {
+                              index: 0,
+                              delta: {
+                                role: 'assistant',
+                                content: delta,
+                              },
+                              finish_reason: null,
+                            },
+                          ],
+                        };
+                        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                      }
+                      
+                      assistantContent = newText;
+                    }
+                  }
+                }
+              }
+            }
+            
+            // If structured output is requested, send tool output as content
+            if (needsStructuredOutput) {
+              if (!toolOutput) {
+                log.error(`[${requestId}] Structured output requested but no tool output received in stream`);
+                controller.error(new Error('Structured output requested but no tool output received'));
+                return;
+              }
+              
+              const toolOutputStr = JSON.stringify(toolOutput);
+              // Send tool output as a single chunk
+              const chunk = {
+                id: responseId,
+                object: 'chat.completion.chunk',
+                created: created,
+                model: modelName,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      role: 'assistant',
+                      content: toolOutputStr,
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
             }
             
             // Send final chunk with finish_reason
@@ -565,6 +756,7 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
               totalTimeMs: totalTime,
               sdkTimeMs: sdkTime,
               responseId,
+              hasToolOutput: !!toolOutput,
             });
             
             controller.close();
@@ -588,6 +780,7 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
     // Non-streaming response
     // Collect assistant messages
     let assistantContent = '';
+    let toolOutput: any = null;
     let lastAssistantMessage: any = null;
     let messageCount = 0;
     let assistantMessageCount = 0;
@@ -605,6 +798,31 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
         hasMessage: 'message' in message,
       });
       
+      // Check for tool result messages (MCP tools return results)
+      if (message.type === 'result' && needsStructuredOutput) {
+        const resultMessage = message as any;
+        if (resultMessage.subtype === 'success' && resultMessage.result) {
+          // Extract tool result content
+          if (resultMessage.result.content && Array.isArray(resultMessage.result.content)) {
+            const textBlocks = resultMessage.result.content.filter(
+              (block: any) => block.type === 'text'
+            );
+            if (textBlocks.length > 0) {
+              const resultText = textBlocks.map((block: any) => block.text).join('\n');
+              try {
+                // Parse the JSON string returned by the tool
+                toolOutput = JSON.parse(resultText);
+                log.info(`[${requestId}] Tool result extracted from result message`, {
+                  toolOutput,
+                });
+              } catch (e) {
+                log.warn(`[${requestId}] Failed to parse tool result as JSON`, { resultText });
+              }
+            }
+          }
+        }
+      }
+      
       if (message.type === 'assistant') {
         assistantMessageCount++;
         lastAssistantMessage = message;
@@ -614,19 +832,42 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
           uuid: message.uuid,
         });
         
-        // Extract text content from the assistant message
+        // Extract content from the assistant message
         const apiMessage = message.message;
         if (apiMessage.content && Array.isArray(apiMessage.content)) {
-          const textBlocks = apiMessage.content.filter(
-            (block: any) => block.type === 'text'
-          );
-          if (textBlocks.length > 0) {
-            assistantContent = textBlocks.map((block: any) => block.text).join('\n');
-            log.debug(`[${requestId}] Extracted assistant content`, {
-              contentLength: assistantContent.length,
-              textBlockCount: textBlocks.length,
-              contentPreview: assistantContent.substring(0, 200) + (assistantContent.length > 200 ? '...' : ''),
-            });
+          // Check for tool use blocks if structured output is requested
+          // This extracts the tool input (structured data) that the LLM is trying to return
+          if (needsStructuredOutput && !toolOutput) {
+            const toolUseBlocks = apiMessage.content.filter(
+              (block: any) => block.type === 'tool_use'
+            );
+            
+            if (toolUseBlocks.length > 0) {
+              // Extract tool input - this is the structured data
+              const toolUse = toolUseBlocks[0];
+              if (toolUse.input) {
+                toolOutput = toolUse.input;
+                log.info(`[${requestId}] Tool input extracted from tool_use block`, {
+                  toolName: toolUse.name,
+                  toolOutput,
+                });
+              }
+            }
+          }
+          
+          // Extract text content (for non-structured output only)
+          if (!needsStructuredOutput) {
+            const textBlocks = apiMessage.content.filter(
+              (block: any) => block.type === 'text'
+            );
+            if (textBlocks.length > 0) {
+              assistantContent = textBlocks.map((block: any) => block.text).join('\n');
+              log.debug(`[${requestId}] Extracted assistant content`, {
+                contentLength: assistantContent.length,
+                textBlockCount: textBlocks.length,
+                contentPreview: assistantContent.substring(0, 200) + (assistantContent.length > 200 ? '...' : ''),
+              });
+            }
           }
         }
       }
@@ -640,8 +881,65 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       assistantMessages: assistantMessageCount,
       messageTypes,
       hasContent: !!assistantContent,
+      hasToolOutput: !!toolOutput,
       contentLength: assistantContent.length,
     });
+
+    // If structured output is requested, return only the tool output
+    if (needsStructuredOutput) {
+      if (!toolOutput) {
+        log.error(`[${requestId}] Structured output requested but no tool output received`, {
+          totalMessages: messageCount,
+          messageTypes,
+        });
+        return new Response(
+          JSON.stringify({ error: 'Structured output requested but no tool output received' }),
+          {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+      }
+      
+      log.info(`[${requestId}] Returning structured tool output only`);
+      
+      // Format response with tool output as content
+      const responseStartTime = Date.now();
+      const responseId = `chatcmpl-${Date.now()}`;
+      const openAIResponse = {
+        id: responseId,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: model || 'claude-sonnet-4-5',
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: JSON.stringify(toolOutput),
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0,
+        },
+      };
+      
+      const totalTime = Date.now() - startTime;
+      log.info(`[${requestId}] Structured output response completed`, {
+        totalTimeMs: totalTime,
+        responseId,
+        toolOutput,
+      });
+      
+      return new Response(JSON.stringify(openAIResponse), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
 
     // If no assistant content found, return error
     if (!assistantContent && !lastAssistantMessage) {
@@ -658,7 +956,7 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       );
     }
 
-    // Format response in OpenAI-compatible format
+    // Format response in OpenAI-compatible format (normal response)
     const responseStartTime = Date.now();
     const responseId = `chatcmpl-${Date.now()}`;
     const openAIResponse = {
