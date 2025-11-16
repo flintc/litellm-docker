@@ -9,7 +9,7 @@ curl -X POST http://localhost:5004/v1/chat/completions \
   "messages": [
     {
       "role": "user",
-      "content": "How factual is the generation: The capital of France is Springfield."
+      "content": "How factual is the generation: The capital of France is Paris. Paris was established in 1990"
     }
   ],
   "response_format": {

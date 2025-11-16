@@ -1,42 +1,4 @@
-import { query, createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
-import { z } from 'zod';
-
-// Helper function to convert JSON schema properties to Zod schema
-function jsonSchemaToZod(properties: Record<string, any>, required: string[] = []): Record<string, z.ZodTypeAny> {
-  const zodSchema: Record<string, z.ZodTypeAny> = {};
-  
-  for (const [key, prop] of Object.entries(properties)) {
-    let zodType: z.ZodTypeAny;
-    
-    if (prop.type === 'string') {
-      zodType = z.string();
-    } else if (prop.type === 'number' || prop.type === 'integer') {
-      zodType = z.number();
-    } else if (prop.type === 'boolean') {
-      zodType = z.boolean();
-    } else if (prop.type === 'array') {
-      zodType = z.array(z.any());
-    } else if (prop.type === 'object') {
-      zodType = z.record(z.any());
-    } else {
-      zodType = z.any();
-    }
-    
-    // Add description if available
-    if (prop.description) {
-      zodType = zodType.describe(prop.description);
-    }
-    
-    // Make optional if not in required array
-    if (!required.includes(key)) {
-      zodType = zodType.optional();
-    }
-    
-    zodSchema[key] = zodType;
-  }
-  
-  return zodSchema;
-}
+import { query } from '@anthropic-ai/claude-agent-sdk';
 
 // Logging utility functions
 const log = {
@@ -495,10 +457,13 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       );
     }
 
+    // Check if structured output is requested via response_format
+    const needsStructuredOutput = !!response_format?.json_schema?.schema;
+    
     // Convert OpenAI messages format to a prompt string
     // Combine all messages into a single prompt
     const promptStartTime = Date.now();
-    const prompt = messages
+    let prompt = messages
       .map((msg: { role: string; content: string | Array<{ type: string; text: string }> }) => {
         let content = '';
         if (typeof msg.content === 'string') {
@@ -513,90 +478,38 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
         return `${msg.role}: ${content}`;
       })
       .join('\n\n');
+    
+    // Add structured output instruction if response_format is present
+    if (needsStructuredOutput && response_format?.json_schema?.schema) {
+      const schema = response_format.json_schema.schema;
+      const schemaJson = JSON.stringify(schema, null, 2);
+      prompt += `\n\nYou must provide your response according to the json schema: ${schemaJson} AND NOTHING ELSE. no back ticks, nothing`;
+      
+      log.info(`[${requestId}] Structured output instruction added to prompt`, {
+        schemaProperties: Object.keys(schema.properties || {}),
+        required: schema.required || [],
+      });
+    }
+    
     const promptTime = Date.now() - promptStartTime;
     
     log.info(`[${requestId}] Prompt converted`, {
       promptTimeMs: promptTime,
       promptLength: prompt.length,
       promptPreview: prompt.substring(0, 200) + (prompt.length > 200 ? '...' : ''),
+      hasStructuredOutput: needsStructuredOutput,
     });
-
-    // Check if structured output is requested via response_format
-    const needsStructuredOutput = response_format?.json_schema?.schema?.properties?.score && 
-                                  response_format?.json_schema?.schema?.properties?.reasoning;
     
     // Prepare options for the SDK
-    const options: any = {
+    const options = {
       maxTurns: 1,
       model: model || 'claude-sonnet-4-5',
     };
-    
-    // Add MCP server with tool if structured output is requested
-    if (needsStructuredOutput) {
-      const schema = response_format.json_schema!.schema!;
-      const toolName = response_format.json_schema!.name || 'extract';
-      const mcpServerName = 'structured-output';
-      
-      // Convert JSON schema to Zod schema
-      const zodSchemaFields = jsonSchemaToZod(
-        schema.properties || {},
-        schema.required || []
-      );
-      
-      // Create Zod object schema
-      const zodSchema = z.object(zodSchemaFields);
-      
-      // Create tool with Zod schema
-      const extractTool = tool(
-        toolName,
-        'Extract structured information based on the provided schema. Return the structured data matching the schema.',
-        zodSchemaFields,
-        async (input) => {
-          // Validate input against Zod schema
-          const validated = zodSchema.parse(input);
-          
-          // Return the validated input as tool output
-          // The LLM will receive this and pass it to the user
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(validated),
-              },
-            ],
-          };
-        }
-      );
-      
-      // Create MCP server with the tool
-      const mcpServer = createSdkMcpServer({
-        name: mcpServerName,
-        version: '1.0.0',
-        tools: [extractTool],
-      });
-      
-      // Add MCP server to options
-      options.mcpServers = {
-        [mcpServerName]: mcpServer,
-      };
-      
-      // Specify allowed tools (format: mcp__<server-name>__<tool-name>)
-      options.allowedTools = [`mcp__${mcpServerName}__${toolName}`];
-      
-      log.info(`[${requestId}] Structured output requested via MCP`, {
-        toolName,
-        mcpServerName,
-        schemaProperties: Object.keys(schema.properties || {}),
-        required: schema.required || [],
-        allowedTool: `mcp__${mcpServerName}__${toolName}`,
-      });
-    }
     
     log.info(`[${requestId}] Calling SDK query`, {
       options: {
         maxTurns: options.maxTurns,
         model: options.model,
-        hasTools: !!options.tools,
       },
       promptLength: prompt.length,
     });
@@ -620,60 +533,35 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
             let toolOutput: any = null;
             
             for await (const message of queryResult) {
-              // Check for tool result messages (MCP tools return results)
-              if (message.type === 'result' && needsStructuredOutput && !toolOutput) {
-                const resultMessage = message as any;
-                if (resultMessage.subtype === 'success' && resultMessage.result) {
-                  // Extract tool result content
-                  if (resultMessage.result.content && Array.isArray(resultMessage.result.content)) {
-                    const textBlocks = resultMessage.result.content.filter(
-                      (block: any) => block.type === 'text'
-                    );
-                    if (textBlocks.length > 0) {
-                      const resultText = textBlocks.map((block: any) => block.text).join('\n');
-                      try {
-                        // Parse the JSON string returned by the tool
-                        toolOutput = JSON.parse(resultText);
-                        log.info(`[${requestId}] Tool result extracted in stream from result message`, {
-                          toolOutput,
-                        });
-                      } catch (e) {
-                        log.warn(`[${requestId}] Failed to parse tool result as JSON in stream`, { resultText });
-                      }
-                    }
-                  }
-                }
-              }
-              
               if (message.type === 'assistant') {
                 const apiMessage = message.message;
                 if (apiMessage.content && Array.isArray(apiMessage.content)) {
-                  // Check for tool use blocks if structured output is requested
-                  // This extracts the tool input (structured data) that the LLM is trying to return
-                  if (needsStructuredOutput && !toolOutput) {
-                    const toolUseBlocks = apiMessage.content.filter(
-                      (block: any) => block.type === 'tool_use'
-                    );
+                  // Extract text content
+                  const textBlocks = apiMessage.content.filter(
+                    (block: any) => block.type === 'text'
+                  );
+                  if (textBlocks.length > 0) {
+                    const newText = textBlocks.map((block: any) => block.text).join('\n');
                     
-                    if (toolUseBlocks.length > 0) {
-                      const toolUse = toolUseBlocks[0];
-                      if (toolUse.input) {
-                        toolOutput = toolUse.input;
-                        log.info(`[${requestId}] Tool input extracted in stream from tool_use block`, {
-                          toolName: toolUse.name,
-                          toolOutput,
-                        });
+                    if (needsStructuredOutput) {
+                      // For structured output, try to parse JSON from the text
+                      if (!toolOutput) {
+                        try {
+                          // Try to extract JSON from the text (remove any markdown code blocks if present)
+                          let jsonText = newText.trim();
+                          // Remove markdown code blocks if present
+                          jsonText = jsonText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+                          toolOutput = JSON.parse(jsonText);
+                          log.info(`[${requestId}] JSON extracted from text in stream`, {
+                            toolOutput,
+                          });
+                        } catch (e) {
+                          // If parsing fails, store the text and try again when we have more content
+                          assistantContent = newText;
+                        }
                       }
-                    }
-                  } else if (!needsStructuredOutput) {
-                    // Extract text content (for non-structured output only)
-                    const textBlocks = apiMessage.content.filter(
-                      (block: any) => block.type === 'text'
-                    );
-                    if (textBlocks.length > 0) {
-                      const newText = textBlocks.map((block: any) => block.text).join('\n');
-                      
-                      // Stream incremental content
+                    } else {
+                      // Stream incremental content for non-structured output
                       const delta = newText.slice(assistantContent.length);
                       if (delta) {
                         const chunk = {
@@ -699,6 +587,20 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
                     }
                   }
                 }
+              }
+            }
+            
+            // If structured output and we still don't have parsed JSON, try parsing the full content
+            if (needsStructuredOutput && !toolOutput && assistantContent) {
+              try {
+                let jsonText = assistantContent.trim();
+                jsonText = jsonText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+                toolOutput = JSON.parse(jsonText);
+                log.info(`[${requestId}] JSON extracted from final text in stream`, {
+                  toolOutput,
+                });
+              } catch (e) {
+                log.warn(`[${requestId}] Failed to parse JSON from text in stream`, { assistantContent });
               }
             }
             
@@ -798,31 +700,6 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
         hasMessage: 'message' in message,
       });
       
-      // Check for tool result messages (MCP tools return results)
-      if (message.type === 'result' && needsStructuredOutput) {
-        const resultMessage = message as any;
-        if (resultMessage.subtype === 'success' && resultMessage.result) {
-          // Extract tool result content
-          if (resultMessage.result.content && Array.isArray(resultMessage.result.content)) {
-            const textBlocks = resultMessage.result.content.filter(
-              (block: any) => block.type === 'text'
-            );
-            if (textBlocks.length > 0) {
-              const resultText = textBlocks.map((block: any) => block.text).join('\n');
-              try {
-                // Parse the JSON string returned by the tool
-                toolOutput = JSON.parse(resultText);
-                log.info(`[${requestId}] Tool result extracted from result message`, {
-                  toolOutput,
-                });
-              } catch (e) {
-                log.warn(`[${requestId}] Failed to parse tool result as JSON`, { resultText });
-              }
-            }
-          }
-        }
-      }
-      
       if (message.type === 'assistant') {
         assistantMessageCount++;
         lastAssistantMessage = message;
@@ -835,33 +712,33 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
         // Extract content from the assistant message
         const apiMessage = message.message;
         if (apiMessage.content && Array.isArray(apiMessage.content)) {
-          // Check for tool use blocks if structured output is requested
-          // This extracts the tool input (structured data) that the LLM is trying to return
-          if (needsStructuredOutput && !toolOutput) {
-            const toolUseBlocks = apiMessage.content.filter(
-              (block: any) => block.type === 'tool_use'
-            );
+          // Extract text content
+          const textBlocks = apiMessage.content.filter(
+            (block: any) => block.type === 'text'
+          );
+          if (textBlocks.length > 0) {
+            const textContent = textBlocks.map((block: any) => block.text).join('\n');
             
-            if (toolUseBlocks.length > 0) {
-              // Extract tool input - this is the structured data
-              const toolUse = toolUseBlocks[0];
-              if (toolUse.input) {
-                toolOutput = toolUse.input;
-                log.info(`[${requestId}] Tool input extracted from tool_use block`, {
-                  toolName: toolUse.name,
-                  toolOutput,
-                });
+            if (needsStructuredOutput) {
+              // For structured output, try to parse JSON from the text
+              if (!toolOutput) {
+                try {
+                  // Try to extract JSON from the text (remove any markdown code blocks if present)
+                  let jsonText = textContent.trim();
+                  // Remove markdown code blocks if present
+                  jsonText = jsonText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+                  toolOutput = JSON.parse(jsonText);
+                  log.info(`[${requestId}] JSON extracted from text`, {
+                    toolOutput,
+                  });
+                } catch (e) {
+                  // If parsing fails, accumulate text and try again later
+                  assistantContent += (assistantContent ? '\n' : '') + textContent;
+                }
               }
-            }
-          }
-          
-          // Extract text content (for non-structured output only)
-          if (!needsStructuredOutput) {
-            const textBlocks = apiMessage.content.filter(
-              (block: any) => block.type === 'text'
-            );
-            if (textBlocks.length > 0) {
-              assistantContent = textBlocks.map((block: any) => block.text).join('\n');
+            } else {
+              // For non-structured output, accumulate text content
+              assistantContent = textContent;
               log.debug(`[${requestId}] Extracted assistant content`, {
                 contentLength: assistantContent.length,
                 textBlockCount: textBlocks.length,
@@ -875,6 +752,20 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
     
     const sdkTime = Date.now() - sdkStartTime;
     
+    // If structured output and we still don't have parsed JSON, try parsing the accumulated content
+    if (needsStructuredOutput && !toolOutput && assistantContent) {
+      try {
+        let jsonText = assistantContent.trim();
+        jsonText = jsonText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+        toolOutput = JSON.parse(jsonText);
+        log.info(`[${requestId}] JSON extracted from final accumulated text`, {
+          toolOutput,
+        });
+      } catch (e) {
+        log.warn(`[${requestId}] Failed to parse JSON from accumulated text`, { assistantContent });
+      }
+    }
+    
     log.info(`[${requestId}] SDK query completed`, {
       sdkTimeMs: sdkTime,
       totalMessages: messageCount,
@@ -885,15 +776,16 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       contentLength: assistantContent.length,
     });
 
-    // If structured output is requested, return only the tool output
+    // If structured output is requested, return only the parsed JSON
     if (needsStructuredOutput) {
       if (!toolOutput) {
-        log.error(`[${requestId}] Structured output requested but no tool output received`, {
+        log.error(`[${requestId}] Structured output requested but no valid JSON received`, {
           totalMessages: messageCount,
           messageTypes,
+          assistantContent: assistantContent.substring(0, 500),
         });
         return new Response(
-          JSON.stringify({ error: 'Structured output requested but no tool output received' }),
+          JSON.stringify({ error: 'Structured output requested but no valid JSON received' }),
           {
             status: 500,
             headers: { 'Content-Type': 'application/json' },
