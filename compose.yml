@@ -1,4 +1,37 @@
 services:
+  openai-proxy:
+    build:
+      context: proxy-src
+      dockerfile: Dockerfile
+    image: claude-code-openai-proxy:latest
+    container_name: claude-code-openai-proxy
+    ports:
+      - "5004:5004"
+    environment:
+      NODE_ENV: development
+      PORT: 5004
+    restart: unless-stopped
+    volumes:
+      # Mount source code for hot reloading (read-write so Bun can watch)
+      # - ./proxy-src:/app
+      # Mount Claude credentials directory for persistence
+      - claude_credentials:/root/.claude
+    develop:
+      watch:
+        - action: sync
+          path: ./proxy-src/openai-proxy.ts
+          target: /app/openai-proxy.ts
+        - action: sync
+          path: ./proxy-src/package.json
+          target: /app/package.json
+        - action: rebuild
+          path: ./proxy-src/Dockerfile
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:5004').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
   litellm:
     build:
       dockerfile: Dockerfile.litellm
@@ -72,3 +105,6 @@ volumes:
     driver: local
   postgres_data:
     name: litellm_postgres_data # Named volume for Postgres data persistence
+  claude_credentials:
+    driver: local
+    name: claude_credentials # Named volume for Claude API credentials persistence

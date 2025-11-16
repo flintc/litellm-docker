@@ -1,1 +1,5 @@
 *.local
+stack.env
+test_proxy.py
+node_modules
+.venv
