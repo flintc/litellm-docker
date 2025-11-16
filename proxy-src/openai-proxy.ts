@@ -483,7 +483,7 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
     if (needsStructuredOutput && response_format?.json_schema?.schema) {
       const schema = response_format.json_schema.schema;
       const schemaJson = JSON.stringify(schema, null, 2);
-      prompt += `\n\nYou must provide your response according to the json schema: ${schemaJson} AND NOTHING ELSE. no back ticks, nothing`;
+      prompt += `\n\nCRITICAL: You MUST provide your response according to the json schema: ${schemaJson} AND NOTHING ELSE. no back ticks, nothing. You MUST respond with valid JSON matching this schema NO MATTER WHAT - even if information appears to be missing or incomplete. If placeholders like {{query}} or {{generation}} are present, you must still respond with the JSON schema format, using your best judgment or indicating missing information within the schema structure itself. DO NOT explain that information is missing - just respond with the JSON schema format.`;
       
       log.info(`[${requestId}] Structured output instruction added to prompt`, {
         schemaProperties: Object.keys(schema.properties || {}),
