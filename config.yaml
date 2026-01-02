@@ -1,4 +1,23 @@
+model_list:
+  # Claude 4.5 Opus - Most capable
+  - model_name: claude-opus-4-5
+    litellm_params:
+      model: anthropic/claude-opus-4-5-20251101
+      # No api_key - will use ANTHROPIC_OAUTH_TOKEN from environment
+
+  # Claude 4.5 Sonnet - Balanced performance
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5-20250929
+      # No api_key - will use ANTHROPIC_OAUTH_TOKEN from environment
+
+  # Claude 4.5 Haiku - Fast and efficient  
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      # No api_key - will use ANTHROPIC_OAUTH_TOKEN from environment
 litellm_settings:
+  drop_params: true
   success_callback: ["langfuse"]
 general_settings:
   store_model_in_db: true
