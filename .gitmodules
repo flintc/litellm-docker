@@ -1,0 +1,4 @@
+[submodule "litellm"]
+	path = litellm
+	url = git@github.com:flintc/litellm.git
+	branch = feature/claude-code-oauth-proxy-credentials

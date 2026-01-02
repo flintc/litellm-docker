@@ -1,5 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
-
+import { startObservation } from '@langfuse/tracing';
+ 
 // Logging utility functions
 const log = {
   info: (message: string, data?: any) => {
@@ -59,11 +60,55 @@ const server = Bun.serve({
       });
     }
 
-    // Route to appropriate POST handler
+    // Route to appropriate POST handler with tracing
     if (url.pathname === '/v1/messages' || url.pathname === '/messages') {
-      return handleMessagesEndpoint(request, requestId, startTime);
+      const trace = startObservation('handle-messages-endpoint', {
+        metadata: {
+          requestId,
+          pathname: url.pathname,
+          method: request.method,
+        },
+      });
+      try {
+        const response = await handleMessagesEndpoint(request, requestId, startTime, trace);
+        trace.update({
+          output: { status: response.status },
+          metadata: { statusCode: response.status },
+        });
+        trace.end();
+        return response;
+      } catch (error) {
+        trace.update({
+          level: 'ERROR',
+          metadata: { error: error instanceof Error ? error.message : String(error) },
+        });
+        trace.end();
+        throw error;
+      }
     } else if (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions' || url.pathname === '/') {
-      return handleChatCompletionsEndpoint(request, requestId, startTime);
+      const trace = startObservation('handle-chat-completions-endpoint', {
+        metadata: {
+          requestId,
+          pathname: url.pathname,
+          method: request.method,
+        },
+      });
+      try {
+        const response = await handleChatCompletionsEndpoint(request, requestId, startTime, trace);
+        trace.update({
+          output: { status: response.status },
+          metadata: { statusCode: response.status },
+        });
+        trace.end();
+        return response;
+      } catch (error) {
+        trace.update({
+          level: 'ERROR',
+          metadata: { error: error instanceof Error ? error.message : String(error) },
+        });
+        trace.end();
+        throw error;
+      }
     } else {
       log.warn(`[${requestId}] Path not found: ${url.pathname}`);
       return new Response(JSON.stringify({ error: 'Not found' }), {
@@ -127,7 +172,7 @@ function handleGetRoot(request: Request, requestId: string, startTime: number): 
 }
 
 // Handler for /v1/messages endpoint (Anthropic Messages API compatible)
-async function handleMessagesEndpoint(request: Request, requestId: string, startTime: number) {
+async function handleMessagesEndpoint(request: Request, requestId: string, startTime: number, parentTrace?: any) {
   try {
     const body = (await request.json()) as {
       model?: string;
@@ -183,6 +228,24 @@ async function handleMessagesEndpoint(request: Request, requestId: string, start
       maxTurns: 1,
       model: model || 'claude-sonnet-4-5',
     };
+
+    // Create generation observation for LLM call
+    const generationObs = parentTrace ? parentTrace.startObservation({
+      name: 'claude-generation',
+      asType: 'generation',
+      model: options.model,
+      input: {
+        prompt,
+        model: options.model,
+        maxTurns: options.maxTurns,
+        temperature,
+        maxTokens: max_tokens,
+      },
+      metadata: {
+        requestId,
+        stream,
+      },
+    }) : null;
 
     // Call the SDK query function
     const sdkStartTime = Date.now();
@@ -271,6 +334,19 @@ async function handleMessagesEndpoint(request: Request, requestId: string, start
               responseId,
             });
             
+            // Update generation observation
+            if (generationObs) {
+              generationObs.update({
+                output: assistantContent,
+                metadata: {
+                  responseId,
+                  contentLength: assistantContent.length,
+                  stream: true,
+                },
+              });
+              generationObs.end();
+            }
+            
             controller.close();
           } catch (error) {
             log.error(`[${requestId}] Streaming error`, error);
@@ -314,6 +390,20 @@ async function handleMessagesEndpoint(request: Request, requestId: string, start
     }
 
     const sdkTime = Date.now() - sdkStartTime;
+
+    // Update generation observation for non-streaming
+    if (generationObs) {
+      generationObs.update({
+        output: assistantContent,
+        metadata: {
+          messageCount,
+          assistantMessageCount,
+          contentLength: assistantContent.length,
+          stream: false,
+        },
+      });
+      generationObs.end();
+    }
 
     if (!assistantContent && !lastAssistantMessage) {
       log.error(`[${requestId}] No assistant response received`);
@@ -387,7 +477,7 @@ async function handleMessagesEndpoint(request: Request, requestId: string, start
 }
 
 // Handler for /v1/chat/completions endpoint (OpenAI compatible)
-async function handleChatCompletionsEndpoint(request: Request, requestId: string, startTime: number) {
+async function handleChatCompletionsEndpoint(request: Request, requestId: string, startTime: number, parentTrace?: any) {
 
   try {
     // Parse OpenAI-compatible request
@@ -513,6 +603,26 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
       },
       promptLength: prompt.length,
     });
+
+    // Create generation observation for LLM call
+    const generationObs = parentTrace ? parentTrace.startObservation({
+      name: 'claude-generation',
+      asType: 'generation',
+      model: options.model,
+      input: {
+        prompt,
+        model: options.model,
+        maxTurns: options.maxTurns,
+        temperature,
+        maxTokens: max_tokens,
+        hasStructuredOutput: needsStructuredOutput,
+      },
+      metadata: {
+        requestId,
+        stream,
+        needsStructuredOutput,
+      },
+    }) : null;
 
     // Call the SDK query function
     const sdkStartTime = Date.now();
@@ -661,6 +771,20 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
               hasToolOutput: !!toolOutput,
             });
             
+            // Update generation observation for streaming
+            if (generationObs) {
+              generationObs.update({
+                output: needsStructuredOutput ? toolOutput : assistantContent,
+                metadata: {
+                  responseId,
+                  contentLength: assistantContent.length,
+                  stream: true,
+                  hasToolOutput: !!toolOutput,
+                },
+              });
+              generationObs.end();
+            }
+            
             controller.close();
           } catch (error) {
             log.error(`[${requestId}] Streaming error`, error);
@@ -751,6 +875,22 @@ async function handleChatCompletionsEndpoint(request: Request, requestId: string
     }
     
     const sdkTime = Date.now() - sdkStartTime;
+    
+    // Update generation observation for non-streaming
+    if (generationObs) {
+      generationObs.update({
+        output: needsStructuredOutput ? toolOutput : assistantContent,
+        metadata: {
+          messageCount,
+          assistantMessageCount,
+          contentLength: assistantContent.length,
+          stream: false,
+          hasToolOutput: !!toolOutput,
+          messageTypes,
+        },
+      });
+      generationObs.end();
+    }
     
     // If structured output and we still don't have parsed JSON, try parsing the accumulated content
     if (needsStructuredOutput && !toolOutput && assistantContent) {

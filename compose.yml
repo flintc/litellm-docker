@@ -36,28 +36,23 @@ services:
     build:
       dockerfile: Dockerfile.litellm
       context: .
-    #   args:
-    #     target: runtime
-    # image: ghcr.io/berriai/litellm:main-stable
-    image: litellm-with-config
-    #########################################
-    ## Uncomment these lines to start proxy with a config.yaml file ##
-    # volumes:
-      # - ./config.yaml:/app/config.yaml
+    image: litellm-oauth:latest
+    container_name: litellm-oauth
+    volumes:
+      # Persist Claude Code credentials for OAuth authentication
+      - claude_credentials:/root/.claude
     command:
       - "--config=/app/config.yaml"
-    ##############################################
     ports:
-      - "4000:4000" # Map the container port to the host, change the host port if necessary
+      - "4000:4000"
     env_file:
-      # - .env.local # Load local .env file
       - stack.env
     environment:
       DATABASE_URL: "postgresql://llmproxy:dbpassword9090@db:5432/litellm"
-      STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
-
+      STORE_MODEL_IN_DB: "True"
+    restart: unless-stopped
     depends_on:
-      - db  # Indicates that this service depends on the 'db' service, ensuring 'db' starts first
+      - db
     healthcheck:  # Defines the health check configuration for the container
       test: [ "CMD-SHELL", "wget --no-verbose --tries=1 http://localhost:4000/health/liveliness || exit 1" ]  # Command to execute for health check
       interval: 30s  # Perform health check every 30 seconds
