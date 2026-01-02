@@ -87,7 +87,7 @@ COPY config.yaml /app/config.yaml
 EXPOSE 4000/tcp
 
 RUN apk add --no-cache supervisor
-# supervisord.conf is already in the cloned repo
-COPY docker/supervisord.conf /etc/supervisord.conf
+# Copy supervisord.conf from the cloned repo (already in /app/docker/)
+RUN cp /app/docker/supervisord.conf /etc/supervisord.conf
 
 ENTRYPOINT ["docker/prod_entrypoint.sh"]
