@@ -1,21 +1,27 @@
-# Build LiteLLM from local submodule with OAuth support
-# Base image for building
+# Build LiteLLM from custom fork with OAuth support
+# Clones the repo during build instead of using submodule (for Portainer compatibility)
+
 ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base
 ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base
+ARG LITELLM_REPO=https://github.com/flintc/litellm.git
+ARG LITELLM_BRANCH=feature/claude-code-oauth-proxy-credentials
 
 # Builder stage
 FROM $LITELLM_BUILD_IMAGE AS builder
 
+ARG LITELLM_REPO
+ARG LITELLM_BRANCH
+
 WORKDIR /app
 USER root
 
-# Install build dependencies
-RUN apk add --no-cache bash gcc py3-pip python3 python3-dev openssl openssl-dev
+# Install build dependencies including git
+RUN apk add --no-cache bash gcc py3-pip python3 python3-dev openssl openssl-dev git
+
+# Clone the custom litellm fork
+RUN git clone --depth 1 --branch ${LITELLM_BRANCH} ${LITELLM_REPO} /app
 
 RUN python -m pip install build
-
-# Copy litellm source from submodule
-COPY litellm/ .
 
 # Build Admin UI
 RUN chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
@@ -37,18 +43,21 @@ RUN pip install PyJWT==2.9.0 --no-cache-dir
 # Runtime stage
 FROM $LITELLM_RUNTIME_IMAGE AS runtime
 
+ARG LITELLM_REPO
+ARG LITELLM_BRANCH
+
 USER root
 
 # Install runtime dependencies including nodejs/npm for Claude Code
-RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip wget
+RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip wget git
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
 WORKDIR /app
 
-# Copy litellm source for runtime files
-COPY litellm/ .
+# Clone again for runtime files (entrypoints, etc)
+RUN git clone --depth 1 --branch ${LITELLM_BRANCH} ${LITELLM_REPO} /app
 
 # Copy the built wheel from the builder stage
 COPY --from=builder /app/dist/*.whl .
@@ -72,12 +81,13 @@ RUN chmod +x docker/prod_entrypoint.sh
 # Create .claude directory for credentials
 RUN mkdir -p /root/.claude
 
-# Copy local config
+# Copy local config (from build context)
 COPY config.yaml /app/config.yaml
 
 EXPOSE 4000/tcp
 
 RUN apk add --no-cache supervisor
-COPY litellm/docker/supervisord.conf /etc/supervisord.conf
+# supervisord.conf is already in the cloned repo
+COPY docker/supervisord.conf /etc/supervisord.conf
 
 ENTRYPOINT ["docker/prod_entrypoint.sh"]
