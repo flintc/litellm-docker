@@ -56,6 +56,7 @@ RUN npm install -g @anthropic-ai/claude-code
 
 # Set up cron job for Claude Code
 RUN mkdir -p /var/run && \
+    mkdir -p /etc/crontabs && \
     echo '0 */2 * * * /usr/local/bin/claude -p "hello, what time is it?" >> /var/log/claude-cron.log 2>&1' > /etc/crontabs/root
 
 WORKDIR /app
