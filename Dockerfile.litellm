@@ -49,10 +49,14 @@ ARG LITELLM_BRANCH
 USER root
 
 # Install runtime dependencies including nodejs/npm for Claude Code
-RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip wget git
+RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip wget git cronie
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
+
+# Set up cron job for Claude Code
+RUN mkdir -p /var/run && \
+    echo '0 */2 * * * /usr/local/bin/claude -p "hello, what time is it?" >> /var/log/claude-cron.log 2>&1' > /etc/crontabs/root
 
 WORKDIR /app
 
