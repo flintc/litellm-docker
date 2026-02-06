@@ -18,7 +18,7 @@ model_list:
       # No api_key - will use ANTHROPIC_OAUTH_TOKEN from environment
   - model_name: claude-opus-4-6
     litellm_params:
-      model: anthropic/claude-opus-4-6-20260205
+      model: anthropic/claude-opus-4-6
       # No api_key - will use ANTHROPIC_OAUTH_TOKEN from environment
 litellm_settings:
   drop_params: true
