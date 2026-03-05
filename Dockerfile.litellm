@@ -48,16 +48,20 @@ ARG LITELLM_BRANCH
 
 USER root
 
-# Install runtime dependencies including nodejs/npm for Claude Code
-RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip wget git cronie
+# Install runtime dependencies including nodejs/npm for Claude Code and tmux
+RUN apk add --no-cache bash openssl tzdata nodejs npm python3 py3-pip wget git cronie tmux
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
-# Set up cron job for Claude Code
+# Copy and setup claude tmux script
+COPY claude-tmux.sh /usr/local/bin/claude-tmux.sh
+RUN chmod +x /usr/local/bin/claude-tmux.sh
+
+# Set up cron job for Claude Code (every 3 hours)
 RUN mkdir -p /var/run && \
     mkdir -p /etc/crontabs && \
-    echo '0 */2 * * * /usr/local/bin/claude -p "hello, what time is it?" >> /var/log/claude-cron.log 2>&1' > /etc/crontabs/root
+    echo '0 */3 * * * /usr/local/bin/claude-tmux.sh >> /var/log/claude-cron.log 2>&1' > /etc/crontabs/root
 
 WORKDIR /app
 
